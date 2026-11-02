@@ -3,6 +3,7 @@ var crypto = require('crypto');
 var fs = require('fs');
 var path = require('path');
 var archive = require('../archiver');
+var ipGuard = require('../lib/ip-guard');
 
 /**
  * Every download gets its own directory under downloads/, which keeps two
@@ -15,6 +16,10 @@ var DOWNLOAD_ROOT = path.join(__dirname, '..', 'downloads');
 // disk. Both limits can be raised through the environment.
 var QUOTA = process.env.DOWNLOAD_QUOTA || '100m';
 var TIMEOUT_MS = Number(process.env.DOWNLOAD_TIMEOUT_MS) || 5 * 60 * 1000;
+
+// Server-wide limit: without it, ten sockets mean ten live wget processes.
+var MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS) || 3;
+var activeJobs = 0;
 
 /**
  * wget --mirror --convert-links --adjust-extension --page-requisites
@@ -29,115 +34,154 @@ module.exports = (socket, data, onFinished) => {
   var done = typeof onFinished === 'function' ? onFinished : function () {};
   var send = (payload) => socket.emit(data.token, payload);
 
-  var target = parseTarget(data.website);
-  if (!target) {
-    send({ error: 'That does not look like a website address. Try something like https://example.com' });
-    done();
-    return null;
-  }
-
-  var jobId = crypto.randomBytes(8).toString('hex');
-  var jobDir = path.join(DOWNLOAD_ROOT, jobId);
-  try {
-    fs.mkdirSync(jobDir, { recursive: true });
-  } catch (err) {
-    send({ error: 'Could not create a working directory on the server: ' + err.message });
-    done();
-    return null;
-  }
-
-  // execFile rather than exec: the address is passed as a separate argument and
-  // never reaches a shell, so it cannot be used to run other commands.
-  var child = execFile('wget', [
-    '-mkEpnp',
-    '--no-if-modified-since',
-    '--quota=' + QUOTA,
-    target.href
-  ], { cwd: jobDir, maxBuffer: 32 * 1024 * 1024 });
-
-  var settled = false;
+  // Failures before the child starts have nothing to cancel, but the flag
+  // covers the window between "handle created" and "child spawned".
+  var child = null;
   var cancelled = false;
-  var timedOut = false;
-  var stderrTail = [];
 
-  var timer = setTimeout(() => {
-    timedOut = true;
-    child.kill();
-  }, TIMEOUT_MS);
-
-  var fail = (message) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    removeJobDir(jobDir);
-    send({ error: message });
-    done();
-  };
-
-  // Fires when wget itself cannot be started, which on a fresh machine almost
-  // always means it is not installed.
-  child.on('error', (err) => {
-    if (err.code === 'ENOENT') {
-      fail('wget is not installed on the server. Install it and restart the app: ' +
-           'apt install wget, brew install wget, or winget install JernejSimoncic.Wget');
-      return;
-    }
-    fail('Could not start the download: ' + err.message);
-  });
-
-  child.stderr.on('data', (chunk) => {
-    var text = chunk.toString();
-    stderrTail = stderrTail.concat(text.split('\n')).slice(-60);
-    send({ progress: text });
-  });
-
-  child.on('close', (code) => {
-    if (settled) return;
-    clearTimeout(timer);
-
-    if (cancelled) {
-      settled = true;
-      removeJobDir(jobDir);
-      done();
-      return;
-    }
-    if (timedOut) {
-      fail('The download took longer than ' + Math.round(TIMEOUT_MS / 1000) +
-           ' seconds and was stopped. Try a smaller site or a specific page.');
-      return;
-    }
-
-    // Trust the filesystem rather than wget's output. wget writes nothing at
-    // all for an off-site redirect, a robots.txt exclusion or a 403, and the
-    // previous approach of naming the folder from the first "Resolving" line
-    // then archived a directory that was never created.
-    if (countFiles(jobDir) === 0) {
-      fail('Nothing could be downloaded from ' + target.hostname + '. ' +
-           explainFailure(stderrTail, code));
-      return;
-    }
-
-    settled = true;
-    send({ progress: 'Converting' });
-
-    var zipName = target.hostname.replace(/[^a-zA-Z0-9._-]/g, '_') + '-' + jobId;
-    archive(jobDir, zipName, (err, name) => {
-      removeJobDir(jobDir);
-      if (err) {
-        send({ error: 'The site downloaded but could not be compressed: ' + err.message });
-      } else {
-        send({ progress: 'Completed', file: name });
-      }
-      done();
-    });
-  });
-
-  return {
+  var handle = {
     cancel: function () {
       cancelled = true;
-      child.kill();
+      if (child) child.kill();
     }
   };
+
+  (async () => {
+    var target = parseTarget(data.website);
+    if (!target) {
+      send({ error: 'That does not look like a website address. Try something like https://example.com' });
+      done();
+      return;
+    }
+
+    // SSRF guard: resolve first, refuse anything that answers on a
+    // private/loopback/link-local address. Runs before any file or process
+    // work so a rejected target leaves nothing behind.
+    try {
+      await ipGuard.assertPublicTarget(target);
+    } catch (err) {
+      send({ error: err.message });
+      done();
+      return;
+    }
+
+    if (activeJobs >= MAX_CONCURRENT_JOBS) {
+      send({ error: 'The server is busy with ' + MAX_CONCURRENT_JOBS + ' downloads already running. Try again in a few minutes.' });
+      done();
+      return;
+    }
+
+    var jobId = crypto.randomBytes(8).toString('hex');
+    var jobDir = path.join(DOWNLOAD_ROOT, jobId);
+    try {
+      fs.mkdirSync(jobDir, { recursive: true });
+    } catch (err) {
+      send({ error: 'Could not create a working directory on the server: ' + err.message });
+      done();
+      return;
+    }
+
+    if (cancelled) {
+      removeJobDir(jobDir);
+      done();
+      return;
+    }
+
+    // execFile rather than exec: the address is passed as a separate argument and
+    // never reaches a shell, so it cannot be used to run other commands.
+    child = execFile('wget', [
+      '-mkEpnp',
+      '--no-if-modified-since',
+      '--quota=' + QUOTA,
+      target.href
+    ], { cwd: jobDir, maxBuffer: 32 * 1024 * 1024 });
+
+    activeJobs++;
+    var settled = false;
+    var timedOut = false;
+    var stderrTail = [];
+
+    var timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, TIMEOUT_MS);
+
+    var fail = (message) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      removeJobDir(jobDir);
+      activeJobs--;
+      send({ error: message });
+      done();
+    };
+
+    // Fires when wget itself cannot be started, which on a fresh machine almost
+    // always means it is not installed.
+    child.on('error', (err) => {
+      if (err.code === 'ENOENT') {
+        fail('wget is not installed on the server. Install it and restart the app: ' +
+             'apt install wget, brew install wget, or winget install JernejSimoncic.Wget');
+        return;
+      }
+      fail('Could not start the download: ' + err.message);
+    });
+
+    child.stderr.on('data', (chunk) => {
+      var text = chunk.toString();
+      stderrTail = stderrTail.concat(text.split('\n')).slice(-60);
+      send({ progress: text });
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      clearTimeout(timer);
+      activeJobs--;
+
+      if (cancelled) {
+        settled = true;
+        removeJobDir(jobDir);
+        done();
+        return;
+      }
+      if (timedOut) {
+        fail('The download took longer than ' + Math.round(TIMEOUT_MS / 1000) +
+             ' seconds and was stopped. Try a smaller site or a specific page.');
+        return;
+      }
+
+      // Trust the filesystem rather than wget's output. wget writes nothing at
+      // all for an off-site redirect, a robots.txt exclusion or a 403, and the
+      // previous approach of naming the folder from the first "Resolving" line
+      // then archived a directory that was never created.
+      if (countFiles(jobDir) === 0) {
+        fail('Nothing could be downloaded from ' + target.hostname + '. ' +
+             explainFailure(stderrTail, code));
+        return;
+      }
+
+      settled = true;
+      send({ progress: 'Converting' });
+
+      var zipName = target.hostname.replace(/[^a-zA-Z0-9._-]/g, '_') + '-' + jobId;
+      archive(jobDir, zipName, (err, name) => {
+        removeJobDir(jobDir);
+        if (err) {
+          send({ error: 'The site downloaded but could not be compressed: ' + err.message });
+        } else {
+          send({ progress: 'Completed', file: name });
+        }
+        done();
+      });
+    });
+  })().catch((err) => {
+    // Persistence failure of the setup path itself (mkdir, guard, etc.). The
+    // close handler will not run because no child was started.
+    send({ error: 'Download could not be started: ' + err.message });
+    done();
+  });
+
+  return handle;
 };
 
 /**

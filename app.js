@@ -9,11 +9,22 @@ var usersRouter = require('./routes/users');
 
 var app = express();
 
+// Basic HTTP rate limit. The downloads themselves are limited per-IP in
+// socket/socket.js, this covers the rest of the endpoints.
+var rateLimit = require('express-rate-limit');
+var httpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
 // view engine setup
 app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'hbs');
 
 app.use(logger('dev'));
+app.use(httpLimiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());

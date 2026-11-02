@@ -7,15 +7,16 @@
     "dev": "export NODE_ENV=Development && npm start"
   },
   "dependencies": {
-    "archiver": "^3.1.1",
+    "archiver": "^8.0.0",
     "cookie-parser": "~1.4.4",
     "debug": "~2.6.9",
-    "express": "~4.19.2",
+    "express": "^4.22.3",
+    "express-rate-limit": "^8.7.3",
     "hbs": "~4.2.0",
     "http-errors": "~1.6.3",
     "jszip": "^3.8.0",
     "morgan": "~1.9.1",
-    "socket.io": "^2.5.0",
-    "socket.io-client": "^2.5.0"
+    "socket.io": "^4.8.4",
+    "socket.io-client": "^4.8.4"
   }
 }

@@ -8,6 +8,10 @@ var app = require('../app');
 var debug = require('debug')('website-downloader:server');
 var http = require('http');
 
+// Deletes expired zips and the leftovers of crashed jobs, now and every ~10
+// minutes for as long as this process lives.
+var cleanup = require('../lib/cleanup');
+
 /**
  * Get port from environment and store in Express.
  */
@@ -21,6 +25,8 @@ app.set('port', port);
 
 var server = http.createServer(app);
 var io = require('socket.io')(server);
+
+cleanup.start();
 
 // Pass socket Object to it's modula 
 require('../socket/socket')(io)

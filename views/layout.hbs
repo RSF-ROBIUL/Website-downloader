@@ -39,8 +39,12 @@
 
   // connect to current socket.io server
   var socket = io.connect(document.URL);
+  // One token per browser for the socket event channel. Uses the browser's
+  // built-in crypto instead of Math.random, so it cannot be guessed.
   if(!localStorage['token'])
-  localStorage['token']=generateToken(20);
+  localStorage['token']=(window.crypto && window.crypto.randomUUID)
+    ? window.crypto.randomUUID()
+    : String(window.crypto.getRandomValues(new Uint32Array(4))[0]);
 
   // wait for events for this token
   socket.on(localStorage['token'],(event)=>{
@@ -116,16 +120,6 @@
 
 
 
-
-  // Generate token for each user for the first time.
-  function generateToken(n) {
-    var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    var token = '';
-    for(var i = 0; i < n; i++) {
-        token += chars[Math.floor(Math.random() * chars.length)];
-    }
-    return token;
-}
 </script>
 
 
